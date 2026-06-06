@@ -65,7 +65,7 @@
         try {
           const ctx = new (window.AudioContext || window.webkitAudioContext)();
           let count = 0;
-          const maxBeeps = 10;
+          const maxBeeps = currentUser?.sound_duration || 10;
 
           const beepOnce = () => {
             if (count >= maxBeeps) return;
@@ -85,7 +85,7 @@
 
           beepOnce();
         } catch (e) {}
-      }, []);
+      }, [currentUser]);
 
       const showToast = useCallback((name) => {
         const id = Date.now();
@@ -317,7 +317,7 @@
         if (!newUserName.trim()) return;
         const res = await api.post("/users", { name: newUserName.trim(), password: newUserPassword || null });
         if (res?.id) {
-          const newUser = { id: res.id, name: res.name, has_password: !!res.has_password, theme: "light" };
+          const newUser = { id: res.id, name: res.name, has_password: !!res.has_password, theme: "light", sound_duration: 10 };
           setUsers((p) => [...p, newUser]);
           loginUser(newUser);
         }
@@ -338,6 +338,16 @@
           setUsers((p) => p.map((x) => x.id === currentUser.id ? { ...x, theme: newTheme } : x));
           setCurrentUser((x) => x ? { ...x, theme: newTheme } : x);
         }
+      };
+
+      // Update sound duration locally on drag; persist to the backend only when the drag ends.
+      const handleSoundDurationInput = (value) => {
+        setCurrentUser((x) => x ? { ...x, sound_duration: value } : x);
+        setUsers((p) => p.map((x) => currentUser && x.id === currentUser.id ? { ...x, sound_duration: value } : x));
+      };
+
+      const handleSoundDurationCommit = (value) => {
+        if (currentUser) api.put(`/users/${currentUser.id}/settings`, { sound_duration: value });
       };
 
       const THEMES = {
@@ -595,6 +605,15 @@
                           <button key={t.key} onClick={() => handleThemeChange(t.key)} style={{ padding: "7px 16px", borderRadius: 7, border: "none", background: theme === t.key ? c.accent : "transparent", color: theme === t.key ? "#fff" : c.textMuted, fontSize: 12, fontWeight: theme === t.key ? 500 : 400, cursor: "pointer", fontFamily: "inherit", transition: "all 0.2s" }}>{t.label}</button>
                         ))}
                       </div>
+                    </div>
+                    <div style={{ marginTop: 18, display: "flex", alignItems: "center", gap: 14 }}>
+                      <span style={{ fontSize: 13 }}>Alert Duration</span>
+                      <input type="range" min={5} max={20} step={1} value={currentUser?.sound_duration || 10}
+                        onChange={(e) => handleSoundDurationInput(Number(e.target.value))}
+                        onMouseUp={(e) => handleSoundDurationCommit(Number(e.target.value))}
+                        onTouchEnd={(e) => handleSoundDurationCommit(Number(e.target.value))}
+                        style={{ flex: 1, accentColor: c.accent, cursor: "pointer" }} />
+                      <span style={{ fontSize: 13, fontFamily: "'DM Mono',monospace", color: c.accent, minWidth: 32, textAlign: "right" }}>{currentUser?.sound_duration || 10}s</span>
                     </div>
                     <div style={{ marginTop: 24, paddingTop: 20, borderTop: `1px solid ${c.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                       <span style={{ fontSize: 12, color: c.textMuted }}>Signed in as <span style={{ color: c.text, fontWeight: 500 }}>{currentUser?.name}</span></span>

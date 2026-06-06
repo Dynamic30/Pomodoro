@@ -46,7 +46,8 @@ cursor.execute("""
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
         password TEXT,
-        theme TEXT DEFAULT 'light'
+        theme TEXT DEFAULT 'light',
+        sound_duration INTEGER DEFAULT 10
     )
 """)
 
@@ -84,12 +85,13 @@ class UserLogin(BaseModel):
 class UserSettings(BaseModel):
     password: str = None
     theme: Literal["light", "dark", "sepia"] = None
+    sound_duration: int = None
 
 @app.get("/users")
 async def get_users():
-    cursor.execute("SELECT id, name, password IS NOT NULL as has_password, theme FROM users ORDER BY id")
+    cursor.execute("SELECT id, name, password IS NOT NULL as has_password, theme, sound_duration FROM users ORDER BY id")
     return [
-        {"id": r[0], "name": r[1], "has_password": bool(r[2]), "theme": r[3]}
+        {"id": r[0], "name": r[1], "has_password": bool(r[2]), "theme": r[3], "sound_duration":r[4] or 10}
         for r in cursor.fetchall()
     ]
 
@@ -121,6 +123,10 @@ async def update_settings(user_id: int, data: UserSettings):
     if data.password is not None:
         pwd = data.password if data.password != "" else None
         cursor.execute("UPDATE users SET password = ? WHERE id = ?", (pwd, user_id))
+    if data.sound_duration is not None:
+        clamped = max(5, min(20, data.sound_duration))
+        cursor.execute("UPDATE users SET sound_duration = ? WHERE id = ?", (clamped, user_id))
+
     conn.commit()
     return {"updated": True}
 
