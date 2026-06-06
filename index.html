@@ -52,6 +52,7 @@
       const [passwordInput, setPasswordInput] = useState("");
       const [loginError, setLoginError] = useState("");
       const [showPassword, setShowPassword] = useState(false);
+      const [showUserSwitcher, setShowUserSwitcher] = useState(false);
       const audioCtxRef = useRef(null);
       const topRef = useRef(null);
       const bottomRef = useRef(null);
@@ -62,15 +63,27 @@
 
       const playBeep = useCallback(() => {
         try {
-          const ctx = audioCtxRef.current || new (window.AudioContext || window.webkitAudioContext)();
-          audioCtxRef.current = ctx;
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
-          osc.connect(gain); gain.connect(ctx.destination);
-          osc.frequency.value = 800; osc.type = "sine";
-          gain.gain.setValueAtTime(0.3, ctx.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
-          osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.5);
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          let count = 0;
+          const maxBeeps = 10;
+
+          const beepOnce = () => {
+            if (count >= maxBeeps) return;
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.frequency.value = 880;
+            osc.type = "sine";
+            gain.gain.setValueAtTime(0.3, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
+            osc.start(ctx.currentTime);
+            osc.stop(ctx.currentTime + 0.4);
+            count++;
+            setTimeout(beepOnce, 1000);
+          };
+
+          beepOnce();
         } catch (e) {}
       }, []);
 
@@ -277,14 +290,18 @@
 
       // --- User auth handlers ---
       const loginUser = (user) => {
+        if (currentUser && currentUser.id !== user.id) handleLogout();
         setCurrentUser(user);
         if (user.theme) setTheme(user.theme);
         try { localStorage.setItem("pomo-user", JSON.stringify({ id: user.id, name: user.name })); } catch (e) {}
         setLoginTarget(null); setPasswordInput(""); setLoginError("");
         setShowAddUser(false); setNewUserName(""); setNewUserPassword("");
+        setShowUserSwitcher(false);
       };
 
       const handleSelectUser = (user) => {
+        // Picking the user you're already signed in as just dismisses the switcher.
+        if (currentUser && currentUser.id === user.id) { setShowUserSwitcher(false); return; }
         if (user.has_password) { setLoginTarget(user); setLoginError(""); setPasswordInput(""); }
         else loginUser(user);
       };
@@ -309,7 +326,7 @@
       const handleLogout = () => {
         setCurrentUser(null);
         setTasks([]); setSessions([]); setActiveBreak(null); setPausedByBreak([]);
-        setShowMenu(false); setShowResumePicker(false);
+        setShowMenu(false); setShowResumePicker(false); setShowUserSwitcher(false);
         loadedRef.current = false;
         try { localStorage.removeItem("pomo-user"); } catch (e) {}
       };
@@ -357,7 +374,7 @@
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <div style={{ width: 7, height: 7, borderRadius: "50%", background: c.accent, animation: hasRunning ? "pulse 2s infinite" : "none" }} />
               <span style={{ fontSize: 14, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase" }}>Pomo</span>
-              {currentUser && <button onClick={handleLogout} title="Switch user" style={{ fontSize: 11, color: c.accent, background: c.accentSoft, border: "none", padding: "3px 10px", borderRadius: 6, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>{currentUser.name}</button>}
+              {currentUser && <button onClick={() => setShowUserSwitcher(true)} title="Switch user" style={{ fontSize: 11, color: c.accent, background: c.accentSoft, border: "none", padding: "3px 10px", borderRadius: 6, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>{currentUser.name}</button>}
               {activeTasks.length > 0 && <span style={{ fontSize: 10, color: c.accent, background: c.accentSoft, padding: "2px 8px", borderRadius: 6, fontWeight: 500 }}>{activeTasks.filter((t)=>t.isRunning).length} active</span>}
             </div>
             <div style={{ display: "flex", gap: 6 }}>
@@ -590,7 +607,7 @@
           )}
 
           {/* User selection overlay */}
-          {!currentUser && usersLoaded && (
+          {(!currentUser || showUserSwitcher) && usersLoaded && (
             <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.15)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", zIndex: 250, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
               <div style={{ background: c.surface, border: `1px solid ${c.border}`, borderRadius: 20, padding: "36px 32px", width: "100%", maxWidth: 400, maxHeight: "80vh", overflowY: "auto", boxShadow: `0 12px 48px ${c.shadow}`, animation: "slideDown 0.25s ease" }}>
                 {/* Header */}
@@ -649,6 +666,9 @@
                       ))}
                     </div>
                     <button onClick={() => { setShowAddUser(true); setNewUserName(""); setNewUserPassword(""); }} style={{ width: "100%", padding: "12px 0", borderRadius: 12, border: `1.5px dashed ${c.border}`, background: "transparent", color: c.textMuted, fontSize: 13, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }} onMouseEnter={(e) => { e.currentTarget.style.borderColor=c.accent; e.currentTarget.style.color=c.accent; }} onMouseLeave={(e) => { e.currentTarget.style.borderColor=c.border; e.currentTarget.style.color=c.textMuted; }}>+ Add User</button>
+                    {showUserSwitcher && (
+                      <button onClick={() => setShowUserSwitcher(false)} style={{ width: "100%", marginTop: 8, padding: "12px 0", borderRadius: 12, border: `1px solid ${c.border}`, background: "transparent", color: c.textMuted, fontSize: 13, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }}>Cancel</button>
+                    )}
                   </React.Fragment>
                 )}
               </div>
