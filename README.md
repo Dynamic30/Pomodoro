@@ -11,6 +11,6 @@ Fun pomodoro project which uses fastapi backend to save tasks to sqlite db
 ## Setup
 1. First clone the project 
 2. Install docker (if not already installed -> https://www.docker.com/ | https://docs.docker.com/desktop/)
-3. Run the app -> docker compose up --build -d
+3. Run the app -> `docker compose up --build -d`
 4. Open `http://localhost:8000`
    
