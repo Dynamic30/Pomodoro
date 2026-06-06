@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pomodoro</title>
+  <link rel="icon" href="/favicon.png" type="image/png" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.25.6/babel.min.js"></script>
+  <style>*{box-sizing:border-box;margin:0;padding:0}</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const API = "";
+    const MODE_MAP = { work: "Work", short: "Short Break", long: "Long Break" };
+
+    const api = {
+      get: (path) => fetch(`${API}${path}`).then((r) => r.json()).catch(console.error),
+      post: (path, body) =>
+        fetch(`${API}${path}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json()).catch(console.error),
+      put: (path, body) =>
+        fetch(`${API}${path}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined }).then((r) => r.json()).catch(console.error),
+    };
+
+    function App() {
+      const [theme, setTheme] = useState("light");
+      const [showMenu, setShowMenu] = useState(false);
+      const [menuTab, setMenuTab] = useState("report");
+      const [tasks, setTasks] = useState([]);
+      const [taskInput, setTaskInput] = useState("");
+      const [breakInput, setBreakInput] = useState("");
+      const [timerMinutes, setTimerMinutes] = useState(25);
+      const [mode, setMode] = useState("work");
+      const [activeBreak, setActiveBreak] = useState(null);
+      const [showResumePicker, setShowResumePicker] = useState(false);
+      const [pausedByBreak, setPausedByBreak] = useState([]);
+      const [showCompleteDialog, setShowCompleteDialog] = useState(false);
+      const [completingTaskId, setCompletingTaskId] = useState(null);
+      const [sessions, setSessions] = useState([]);
+      const [toasts, setToasts] = useState([]);
+      const audioCtxRef = useRef(null);
+      const topRef = useRef(null);
+      const bottomRef = useRef(null);
+      const loadedRef = useRef(false);
+
+      const BREAK_PRESETS = { short: 5, long: 15 };
+
+      const playBeep = useCallback(() => {
+        try {
+          const ctx = audioCtxRef.current || new (window.AudioContext || window.webkitAudioContext)();
+          audioCtxRef.current = ctx;
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain); gain.connect(ctx.destination);
+          osc.frequency.value = 800; osc.type = "sine";
+          gain.gain.setValueAtTime(0.3, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+          osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.5);
+        } catch (e) {}
+      }, []);
+
+      const showToast = useCallback((name) => {
+        const id = Date.now();
+        setToasts((p) => [...p, { id, name }]);
+        setTimeout(() => setToasts((p) => p.filter((t) => t.id !== id)), 2500);
+      }, []);
+
+      useEffect(() => {
+        const iv = setInterval(() => {
+          setTasks((prev) => {
+            const next = prev.map((t) => {
+              if (!t.isRunning || t.remaining <= 0) return t;
+              const n = t.remaining - 1;
+              if (n <= 0) {
+                playBeep();
+                setSessions((s) => [...s, { type: "Pomodoro", task: t.name, duration: t.total, completedAt: new Date().toLocaleTimeString() }]);
+                api.put(`/task_complete/${t.backendId}`);
+                showToast(t.name);
+                return null;
+              }
+              if (n % 5 === 0) api.put(`/heartbeat/${t.backendId}`, { timer: n });
+              return { ...t, remaining: n };
+            });
+            return next.filter(Boolean);
+          });
+          setActiveBreak((prev) => {
+            if (!prev || !prev.isRunning || prev.remaining <= 0) return prev;
+            const next = prev.remaining - 1;
+            if (next <= 0) {
+              playBeep();
+              setSessions((s) => [...s, { type: prev.mode === "short" ? "Short Break" : "Long Break", task: prev.name, duration: prev.total, completedAt: new Date().toLocaleTimeString() }]);
+              api.put(`/task_complete/${prev.backendId}`);
+              return { ...prev, remaining: 0, isRunning: false };
+            }
+            if (next % 5 === 0) api.put(`/heartbeat/${prev.backendId}`, { timer: next });
+            return { ...prev, remaining: next };
+          });
+        }, 1000);
+        return () => clearInterval(iv);
+      }, [playBeep]);
+
+      useEffect(() => {
+        if (activeBreak && activeBreak.remaining === 0 && !activeBreak.isRunning) {
+          if (pausedByBreak.length > 0) setShowResumePicker(true);
+          setActiveBreak(null);
+        }
+      }, [activeBreak, pausedByBreak]);
+
+      // Restore UI prefs + report from localStorage, and active timers from the backend.
+      useEffect(() => {
+        try {
+          const raw = localStorage.getItem("pomo-prefs");
+          if (raw) {
+            const s = JSON.parse(raw);
+            if (s.theme) setTheme(s.theme);
+            if (s.mode) setMode(s.mode);
+            if (typeof s.timerMinutes === "number") setTimerMinutes(s.timerMinutes);
+            if (Array.isArray(s.sessions)) setSessions(s.sessions);
+          }
+        } catch (e) {}
+
+        // SQLite's updated_at is "YYYY-MM-DD HH:MM:SS" in UTC — parse it as UTC.
+        const elapsedSince = (updatedAt) => {
+          const t = Date.parse((updatedAt || "").replace(" ", "T") + "Z");
+          return isNaN(t) ? 0 : Math.max(0, Math.floor((Date.now() - t) / 1000));
+        };
+
+        api.get("/fetch_active_timer").then((rows) => {
+          if (Array.isArray(rows)) {
+            const restoredTasks = [];
+            let restoredBreak = null;
+            for (const r of rows) {
+              const running = r.status === "Running" || r.status === "Restarted";
+              const remaining = Math.max(0, r.timer - (running ? elapsedSince(r.updated_at) : 0));
+              if (r.mode === "Work") {
+                restoredTasks.push({
+                  id: r.id, backendId: r.id, name: r.task, total: r.duration, remaining,
+                  isRunning: running && remaining > 0, isPausedByBreak: false,
+                  status: running && remaining > 0 ? "Running" : remaining <= 0 ? "Completed" : "Paused",
+                });
+              } else if (running && remaining > 0 && !restoredBreak) {
+                restoredBreak = {
+                  id: r.id, backendId: r.id, name: r.task,
+                  mode: r.mode === "Short Break" ? "short" : "long",
+                  total: r.duration, remaining, isRunning: true,
+                };
+              }
+            }
+            setTasks(restoredTasks);
+            if (restoredBreak) setActiveBreak(restoredBreak);
+          }
+        }).finally(() => { loadedRef.current = true; });
+      }, []);
+
+      // Persist UI prefs + report (timers live in the backend, not here).
+      useEffect(() => {
+        if (!loadedRef.current) return;
+        try {
+          localStorage.setItem("pomo-prefs", JSON.stringify({ theme, mode, timerMinutes, sessions }));
+        } catch (e) {}
+      }, [theme, mode, timerMinutes, sessions]);
+
+      const fmt = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+      const handleWheel = (e) => { e.preventDefault(); setTimerMinutes((p) => Math.max(1, Math.min(90, p + (e.deltaY < 0 ? 1 : -1)))); };
+
+      const handleStartPomodoro = async () => {
+        if (!taskInput.trim() || activeBreak) return;
+        const secs = timerMinutes * 60;
+        const res = await api.post("/set_timer", { method: MODE_MAP[mode] || "Work", timer: secs, task: taskInput.trim() });
+        if (res?.id) {
+          setTasks((p) => [...p, { id: Date.now(), backendId: res.id, name: taskInput.trim(), total: secs, remaining: secs, isRunning: true, isPausedByBreak: false, status: "Running" }]);
+          setTaskInput("");
+        }
+      };
+
+      const handleStartBreak = async () => {
+        if (!breakInput.trim() || activeBreak) return;
+        const mins = BREAK_PRESETS[mode] || 5;
+        const secs = mins * 60;
+        const res = await api.post("/set_timer", { method: MODE_MAP[mode], timer: secs, task: breakInput.trim() });
+        const runningTasks = tasks.filter((t) => t.isRunning);
+        for (const t of runningTasks) { api.put(`/update_timer/${t.backendId}`, { status: "Paused", timer: t.remaining }); }
+        const ids = runningTasks.map((t) => t.id);
+        setTasks((p) => p.map((t) => t.isRunning ? { ...t, isRunning: false, isPausedByBreak: true } : t));
+        setPausedByBreak(ids);
+        setActiveBreak({ id: Date.now(), backendId: res?.id, name: breakInput.trim(), mode, total: secs, remaining: secs, isRunning: true });
+        setBreakInput("");
+      };
+
+      const handleResumeTask = (id) => {
+        const t = tasks.find((x) => x.id === id);
+        if (t) api.put(`/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining });
+        setTasks((p) => p.map((x) => x.id === id ? { ...x, isRunning: true, isPausedByBreak: false } : x));
+        setPausedByBreak([]); setShowResumePicker(false);
+      };
+
+      const handleResumeAll = () => {
+        tasks.filter((t) => t.isPausedByBreak).forEach((t) => { api.put(`/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining }); });
+        setTasks((p) => p.map((t) => t.isPausedByBreak ? { ...t, isRunning: true, isPausedByBreak: false } : t));
+        setPausedByBreak([]); setShowResumePicker(false);
+      };
+
+      const handleCancelBreak = () => {
+        if (!activeBreak) return;
+        api.put(`/task_complete/${activeBreak.backendId}`);
+        tasks.filter((t) => t.isPausedByBreak).forEach((t) => {
+          api.put(`/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining });
+        });
+        setTasks((p) => p.map((t) => t.isPausedByBreak ? { ...t, isRunning: true, isPausedByBreak: false } : t));
+        setActiveBreak(null);
+        setPausedByBreak([]);
+      };
+
+      const handleTogglePause = (id) => {
+        const t = tasks.find((x) => x.id === id);
+        if (t && t.remaining > 0) {
+          api.put(`/update_timer/${t.backendId}`, { status: t.isRunning ? "Paused" : "Running", timer: t.remaining });
+          setTasks((p) => p.map((x) => x.id === id ? { ...x, isRunning: !x.isRunning } : x));
+        }
+      };
+
+      const handleAskComplete = (id) => { setCompletingTaskId(id); setShowCompleteDialog(true); };
+
+      const handleConfirmComplete = () => {
+        const t = tasks.find((x) => x.id === completingTaskId);
+        if (t) { api.put(`/task_complete/${t.backendId}`); setSessions((s) => [...s, { type: "Pomodoro", task: t.name, duration: t.total, completedAt: new Date().toLocaleTimeString() }]); showToast(t.name); }
+        setTasks((p) => p.filter((x) => x.id !== completingTaskId));
+        setShowCompleteDialog(false); setCompletingTaskId(null);
+      };
+
+      const handleDismiss = (id) => setTasks((p) => p.filter((t) => t.id !== id));
+      const scrollToAdd = () => bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      const scrollToTop = () => topRef.current?.scrollIntoView({ behavior: "smooth" });
+
+      const THEMES = {
+        light: { bg: "#faf8f5", bgDim: "#f0ece6", surface: "#ffffff", text: "#2d2d2d", textMuted: "#999", accent: "#d35d45", accentSoft: "rgba(211,93,69,0.08)", ring: "#d35d45", ringTrack: "rgba(211,93,69,0.1)", border: "rgba(0,0,0,0.06)", shadow: "rgba(0,0,0,0.06)", overlay: "rgba(0,0,0,0.35)", green: "#16a34a", greenSoft: "rgba(22,163,74,0.08)", pillBg: "#ffffff" },
+        dark: { bg: "#1a1a2e", bgDim: "#141425", surface: "#16213e", text: "#e0e0e0", textMuted: "#8a8a9a", accent: "#e07a5f", accentSoft: "rgba(224,122,95,0.15)", ring: "#e07a5f", ringTrack: "rgba(224,122,95,0.12)", border: "rgba(255,255,255,0.06)", shadow: "rgba(0,0,0,0.3)", overlay: "rgba(0,0,0,0.6)", green: "#4ade80", greenSoft: "rgba(74,222,128,0.12)", pillBg: "#1e2a4a" },
+        sepia: { bg: "#f5efe6", bgDim: "#e9e2d6", surface: "#fbf7f0", text: "#5b4636", textMuted: "#a3927a", accent: "#bb6b3d", accentSoft: "rgba(187,107,61,0.1)", ring: "#bb6b3d", ringTrack: "rgba(187,107,61,0.14)", border: "rgba(91,70,54,0.12)", shadow: "rgba(91,70,54,0.1)", overlay: "rgba(60,45,30,0.4)", green: "#6b8e3d", greenSoft: "rgba(107,142,61,0.12)", pillBg: "#fbf7f0" },
+      };
+      const c = THEMES[theme] || THEMES.light;
+
+      const activeTasks = tasks.filter((t) => t.remaining > 0);
+      const completedTasks = tasks.filter((t) => t.remaining === 0);
+      const hasRunning = activeTasks.some((t) => t.isRunning) || activeBreak?.isRunning;
+      const completingTask = tasks.find((t) => t.id === completingTaskId);
+      const isBreakMode = mode === "short" || mode === "long";
+      const inFocus = activeTasks.length > 0;
+
+      const workSessions = sessions.filter((s) => s.type === "Pomodoro");
+      const breakSessions = sessions.filter((s) => s.type !== "Pomodoro");
+      const avgWork = workSessions.length ? Math.round(workSessions.reduce((a,b) => a+b.duration, 0) / workSessions.length / 60) : 0;
+      const avgBreak = breakSessions.length ? Math.round(breakSessions.reduce((a,b) => a+b.duration, 0) / breakSessions.length / 60) : 0;
+
+      // Lock page scroll when there are no active timers (single circular page); allow it once tasks exist.
+      useEffect(() => {
+        document.body.style.overflow = inFocus ? "auto" : "hidden";
+        return () => { document.body.style.overflow = ""; };
+      }, [inFocus]);
+
+      return (
+        <div style={{ minHeight: "100vh", background: inFocus ? c.bgDim : c.bg, color: c.text, fontFamily: "'DM Sans','Helvetica Neue',sans-serif", transition: "background 0.6s ease, color 0.4s", display: "flex", flexDirection: "column" }}>
+          <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500&family=DM+Mono:wght@300;400&display=swap" rel="stylesheet" />
+
+          {/* Top Bar */}
+          <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 28px", borderBottom: `1px solid ${c.border}`, flexShrink: 0, opacity: inFocus ? 0.6 : 1, transition: "opacity 0.4s" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <div style={{ width: 7, height: 7, borderRadius: "50%", background: c.accent, animation: hasRunning ? "pulse 2s infinite" : "none" }} />
+              <span style={{ fontSize: 14, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase" }}>Pomo</span>
+              {activeTasks.length > 0 && <span style={{ fontSize: 10, color: c.accent, background: c.accentSoft, padding: "2px 8px", borderRadius: 6, fontWeight: 500 }}>{activeTasks.filter((t)=>t.isRunning).length} active</span>}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button onClick={() => setShowMenu((v) => !v)} style={{ background: showMenu ? c.accentSoft : "transparent", border: `1px solid ${c.border}`, color: c.text, padding: "6px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontFamily: "inherit", transition: "all 0.2s" }}>Menu</button>
+            </div>
+          </header>
+
+          {/* Break Banner */}
+          {activeBreak && (
+            <div style={{ background: c.accentSoft, padding: "12px 28px", display: "flex", alignItems: "center", justifyContent: "space-between", borderBottom: `1px solid ${c.border}`, animation: "slideDown 0.2s ease", flexShrink: 0 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 12, color: c.accent, fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.06em" }}>{activeBreak.mode === "short" ? "Short" : "Long"} Break</span>
+                <span style={{ fontSize: 12, color: c.textMuted }}>·</span>
+                <span style={{ fontSize: 13, color: c.text }}>{activeBreak.name}</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 20, fontWeight: 300, color: c.accent }}>{fmt(activeBreak.remaining)}</span>
+                <button onClick={handleCancelBreak} style={{ background: "transparent", border: `1px solid ${c.accent}`, color: c.accent, padding: "4px 12px", borderRadius: 6, cursor: "pointer", fontSize: 11, fontFamily: "inherit", letterSpacing: "0.04em", opacity: 0.8, transition: "opacity 0.15s" }} onMouseEnter={(e) => e.currentTarget.style.opacity="1"} onMouseLeave={(e) => e.currentTarget.style.opacity="0.8"}>Cancel</button>
+              </div>
+            </div>
+          )}
+
+          {/* Scrollable Body */}
+          <div style={{ flex: 1, height: 0, minHeight: 0, overflowY: inFocus ? "auto" : "hidden", scrollSnapType: inFocus ? "y proximity" : "none", scrollBehavior: "smooth", WebkitOverflowScrolling: "touch", overscrollBehavior: "contain" }}>
+
+            {/* FOCUS ZONE */}
+            {activeTasks.length > 0 && (
+              <div ref={topRef} style={{ minHeight: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "40px 24px", gap: 12, scrollSnapAlign: "start" }}>
+                {activeTasks.map((t, idx) => {
+                  const progress = t.total > 0 ? ((t.total - t.remaining) / t.total) * 100 : 0;
+                  return (
+                    <div key={t.id} style={{ display: "flex", alignItems: "center", background: c.pillBg, borderRadius: 16, padding: "20px 24px", boxShadow: `0 2px 12px ${c.shadow}`, gap: 20, width: "100%", maxWidth: 520, animation: "slideDown 0.3s ease", position: "relative", overflow: "hidden", border: t.isRunning ? `1px solid ${c.accentSoft}` : `1px solid ${c.border}`, transition: "border 0.3s, box-shadow 0.3s" }}>
+                      <div style={{ position: "absolute", bottom: 0, left: 0, width: `${progress}%`, height: 2, background: t.isRunning ? c.accent : c.textMuted, transition: "width 1s linear", opacity: 0.5 }} />
+                      <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 36, fontWeight: 300, color: t.isRunning ? c.accent : c.textMuted, minWidth: 120, transition: "color 0.3s", letterSpacing: "0.02em" }}>{fmt(t.remaining)}</div>
+                      <div style={{ width: 1, height: 40, background: c.border, flexShrink: 0 }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 15, fontWeight: 400, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 3 }}>{t.name}</div>
+                        <div style={{ fontSize: 11, color: t.isPausedByBreak ? c.accent : c.textMuted, letterSpacing: "0.03em" }}>{t.isPausedByBreak ? "⏸ On break" : t.isRunning ? "Running" : "Paused"}</div>
+                      </div>
+                      <button onClick={() => handleTogglePause(t.id)} disabled={t.isPausedByBreak} style={{ background: "transparent", border: `1px solid ${c.border}`, color: t.isPausedByBreak ? c.border : c.textMuted, padding: "6px 14px", borderRadius: 8, cursor: t.isPausedByBreak ? "not-allowed" : "pointer", fontSize: 11, fontFamily: "inherit", textTransform: "uppercase", letterSpacing: "0.04em", transition: "all 0.15s", flexShrink: 0 }}>{t.isRunning ? "Pause" : "Resume"}</button>
+                      <button onClick={() => handleAskComplete(t.id)} style={{ width: 32, height: 32, borderRadius: 9, border: `2px solid ${c.green}`, background: "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", transition: "all 0.15s", padding: 0, flexShrink: 0 }} onMouseEnter={(e) => { e.currentTarget.style.background = c.greenSoft; }} onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }} title="Mark as complete">
+                        <svg width="16" height="16" viewBox="0 0 12 12" fill="none"><path d="M2 6L5 9L10 3" stroke={c.green} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.7" /></svg>
+                      </button>
+                    </div>
+                  );
+                })}
+
+                <button onClick={scrollToAdd} style={{ marginTop: 16, background: "transparent", border: "none", color: c.textMuted, cursor: "pointer", fontSize: 12, fontFamily: "inherit", display: "flex", flexDirection: "column", alignItems: "center", gap: 4, opacity: 0.6, transition: "opacity 0.2s", padding: 8 }} onMouseEnter={(e) => e.currentTarget.style.opacity="1"} onMouseLeave={(e) => e.currentTarget.style.opacity="0.6"}>
+                  <span style={{ letterSpacing: "0.06em", textTransform: "uppercase" }}>Add another task</span>
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 6L8 10L12 6" stroke={c.textMuted} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                </button>
+              </div>
+            )}
+
+            {/* Empty State */}
+            {activeTasks.length === 0 && !isBreakMode && (
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "100%", padding: "40px 20px", gap: 28 }}>
+                <div style={{ display: "flex", gap: 4, background: c.surface, padding: 4, borderRadius: 12, boxShadow: `0 1px 3px ${c.shadow}` }}>
+                  {[{ key: "work", label: "Pomodoro" }, { key: "short", label: "Short Break" }, { key: "long", label: "Long Break" }].map((p) => (
+                    <button key={p.key} onClick={() => setMode(p.key)} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: mode === p.key ? c.accent : "transparent", color: mode === p.key ? "#fff" : c.textMuted, fontSize: 13, fontWeight: mode === p.key ? 500 : 400, cursor: "pointer", fontFamily: "inherit", transition: "all 0.25s" }}>{p.label}</button>
+                  ))}
+                </div>
+                <div onWheel={handleWheel} style={{ position: "relative", width: 300, height: 300, cursor: "ns-resize", userSelect: "none" }} title="Scroll to adjust">
+                  <svg width="300" height="300" viewBox="0 0 300 300"><circle cx="150" cy="150" r="130" fill="none" stroke={c.ringTrack} strokeWidth="4" /></svg>
+                  <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", textAlign: "center" }}>
+                    <div style={{ fontSize: 64, fontFamily: "'DM Mono',monospace", fontWeight: 300, letterSpacing: "0.04em", lineHeight: 1 }}>{String(timerMinutes).padStart(2,"0")}:00</div>
+                    <div style={{ fontSize: 11, color: c.textMuted, marginTop: 12, letterSpacing: "0.05em", textTransform: "uppercase" }}>scroll to adjust</div>
+                  </div>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 16, width: "100%", maxWidth: 340 }}>
+                  <input type="text" value={taskInput} onChange={(e) => setTaskInput(e.target.value)} placeholder="what are you working on?" onKeyDown={(e) => e.key === "Enter" && handleStartPomodoro()} style={{ background: "transparent", border: "none", borderBottom: `1.5px solid ${c.border}`, color: c.text, fontSize: 15, fontFamily: "inherit", textAlign: "center", padding: "10px 16px", width: "100%", outline: "none", transition: "all 0.2s", letterSpacing: "0.02em" }} onFocus={(e) => e.target.style.borderBottomColor=c.accent} onBlur={(e) => e.target.style.borderBottomColor=c.border} />
+                  <button onClick={handleStartPomodoro} disabled={!taskInput.trim() || !!activeBreak} style={{ padding: "14px 48px", borderRadius: 12, border: "none", background: taskInput.trim() && !activeBreak ? c.accent : c.border, color: taskInput.trim() && !activeBreak ? "#fff" : c.textMuted, fontSize: 15, fontWeight: 500, cursor: taskInput.trim() && !activeBreak ? "pointer" : "not-allowed", fontFamily: "inherit", letterSpacing: "0.04em", transition: "all 0.2s", boxShadow: taskInput.trim() && !activeBreak ? `0 2px 12px ${c.accentSoft}` : "none" }}>{activeBreak ? "Break in progress" : "Start Pomodoro"}</button>
+                </div>
+              </div>
+            )}
+
+            {/* Add More Section */}
+            {(activeTasks.length > 0 || isBreakMode) && (
+              <div ref={bottomRef} style={{ minHeight: "100%", position: "relative", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 28, padding: "40px 20px", scrollSnapAlign: "start" }}>
+                <React.Fragment>
+                  {activeTasks.length > 0 && (
+                    <button onClick={scrollToTop} style={{ position: "absolute", top: 24, background: "transparent", border: `1px solid ${c.border}`, color: c.textMuted, padding: "6px 16px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontFamily: "inherit", display: "flex", alignItems: "center", gap: 6, transition: "all 0.2s" }} onMouseEnter={(e) => { e.currentTarget.style.borderColor = c.accent; e.currentTarget.style.color = c.accent; }} onMouseLeave={(e) => { e.currentTarget.style.borderColor = c.border; e.currentTarget.style.color = c.textMuted; }}>
+                      <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M4 10L8 6L12 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                      Back to tasks
+                    </button>
+                  )}
+                  <div style={{ display: "flex", gap: 4, background: c.surface, padding: 4, borderRadius: 12, boxShadow: `0 1px 3px ${c.shadow}` }}>
+                    {[{ key: "work", label: "Pomodoro" }, { key: "short", label: "Short Break" }, { key: "long", label: "Long Break" }].map((p) => (
+                      <button key={p.key} onClick={() => setMode(p.key)} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: mode === p.key ? c.accent : "transparent", color: mode === p.key ? "#fff" : c.textMuted, fontSize: 13, fontWeight: mode === p.key ? 500 : 400, cursor: "pointer", fontFamily: "inherit", transition: "all 0.25s" }}>{p.label}</button>
+                    ))}
+                  </div>
+
+                  {!isBreakMode ? (
+                    <React.Fragment>
+                      <div onWheel={handleWheel} style={{ position: "relative", width: 280, height: 280, cursor: "ns-resize", userSelect: "none" }} title="Scroll to adjust">
+                        <svg width="280" height="280" viewBox="0 0 280 280"><circle cx="140" cy="140" r="120" fill="none" stroke={c.ringTrack} strokeWidth="3" /></svg>
+                        <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", textAlign: "center" }}>
+                          <div style={{ fontSize: 52, fontFamily: "'DM Mono',monospace", fontWeight: 300, letterSpacing: "0.04em", lineHeight: 1 }}>{String(timerMinutes).padStart(2,"0")}:00</div>
+                          <div style={{ fontSize: 10, color: c.textMuted, marginTop: 10, letterSpacing: "0.05em", textTransform: "uppercase" }}>scroll to adjust</div>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14, width: "100%", maxWidth: 320 }}>
+                        <input type="text" value={taskInput} onChange={(e) => setTaskInput(e.target.value)} placeholder="what are you working on?" onKeyDown={(e) => e.key === "Enter" && handleStartPomodoro()} style={{ background: "transparent", border: "none", borderBottom: `1.5px solid ${c.border}`, color: c.text, fontSize: 14, fontFamily: "inherit", textAlign: "center", padding: "10px 16px", width: "100%", outline: "none", transition: "all 0.2s" }} onFocus={(e) => e.target.style.borderBottomColor=c.accent} onBlur={(e) => e.target.style.borderBottomColor=c.border} />
+                        <button onClick={handleStartPomodoro} disabled={!taskInput.trim() || !!activeBreak} style={{ padding: "12px 40px", borderRadius: 12, border: "none", background: taskInput.trim() && !activeBreak ? c.accent : c.border, color: taskInput.trim() && !activeBreak ? "#fff" : c.textMuted, fontSize: 14, fontWeight: 500, cursor: taskInput.trim() && !activeBreak ? "pointer" : "not-allowed", fontFamily: "inherit", transition: "all 0.2s" }}>{activeBreak ? "Break in progress" : "Start Pomodoro"}</button>
+                        {activeBreak && <div style={{ fontSize: 11, color: c.textMuted, textAlign: "center" }}>Cancel the break first to start a new pomodoro</div>}
+                      </div>
+                    </React.Fragment>
+                  ) : (
+                    <React.Fragment>
+                      <div style={{ position: "relative", width: 280, height: 280, userSelect: "none" }}>
+                        <svg width="280" height="280" viewBox="0 0 280 280"><circle cx="140" cy="140" r="120" fill="none" stroke={c.ringTrack} strokeWidth="3" /></svg>
+                        <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", textAlign: "center" }}>
+                          <div style={{ fontSize: 52, fontFamily: "'DM Mono',monospace", fontWeight: 300, letterSpacing: "0.04em", lineHeight: 1 }}>{String(BREAK_PRESETS[mode]).padStart(2,"0")}:00</div>
+                          <div style={{ fontSize: 10, color: c.textMuted, marginTop: 10, letterSpacing: "0.05em", textTransform: "uppercase" }}>{mode === "short" ? "5 min" : "15 min"} break</div>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 14, width: "100%", maxWidth: 320 }}>
+                        <input type="text" value={breakInput} onChange={(e) => setBreakInput(e.target.value)} placeholder="what will you do on your break?" onKeyDown={(e) => e.key === "Enter" && handleStartBreak()} style={{ background: "transparent", border: "none", borderBottom: `1.5px solid ${c.border}`, color: c.text, fontSize: 14, fontFamily: "inherit", textAlign: "center", padding: "10px 16px", width: "100%", outline: "none", transition: "all 0.2s" }} onFocus={(e) => e.target.style.borderBottomColor=c.accent} onBlur={(e) => e.target.style.borderBottomColor=c.border} />
+                        <button onClick={handleStartBreak} disabled={!breakInput.trim() || !!activeBreak} style={{ padding: "12px 40px", borderRadius: 12, border: "none", background: breakInput.trim() && !activeBreak ? c.accent : c.border, color: breakInput.trim() && !activeBreak ? "#fff" : c.textMuted, fontSize: 14, fontWeight: 500, cursor: breakInput.trim() && !activeBreak ? "pointer" : "not-allowed", fontFamily: "inherit", transition: "all 0.2s" }}>{activeBreak ? "Break Active" : "Start Break"}</button>
+                        {activeTasks.filter((t) => t.isRunning).length > 0 && !activeBreak && (
+                          <div style={{ fontSize: 11, color: c.textMuted, textAlign: "center" }}>This will pause {activeTasks.filter((t)=>t.isRunning).length} running pomodoro{activeTasks.filter((t)=>t.isRunning).length !== 1 ? "s" : ""}</div>
+                        )}
+                      </div>
+                    </React.Fragment>
+                  )}
+                </React.Fragment>
+              </div>
+            )}
+          </div>
+
+          {/* Footer */}
+          <footer style={{ flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "14px 28px", borderTop: `1px solid ${c.border}`, fontSize: 11, color: c.textMuted, letterSpacing: "0.04em" }}>
+            <span style={{ width: 5, height: 5, borderRadius: "50%", background: c.accent, opacity: 0.6 }} />
+            <span>Pomodoro — stay focused, one session at a time</span>
+          </footer>
+
+          {/* Complete Dialog */}
+          {showCompleteDialog && completingTask && (
+            <div style={{ position: "fixed", inset: 0, background: c.overlay, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, animation: "fadeIn 0.2s" }} onClick={() => setShowCompleteDialog(false)}>
+              <div style={{ background: c.bg, border: `1px solid ${c.border}`, borderRadius: 16, padding: 32, maxWidth: 340, width: "90%", textAlign: "center", boxShadow: `0 8px 32px ${c.shadow}`, animation: "slideDown 0.25s" }} onClick={(e) => e.stopPropagation()}>
+                <div style={{ width: 48, height: 48, borderRadius: "50%", background: c.greenSoft, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px" }}>
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M5 12L10 17L19 7" stroke={c.green} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                </div>
+                <div style={{ fontSize: 16, fontWeight: 500, marginBottom: 8 }}>Complete this task?</div>
+                <div style={{ fontSize: 14, color: c.textMuted, marginBottom: 8 }}>{completingTask.name}</div>
+                <div style={{ fontSize: 12, color: c.textMuted, marginBottom: 24 }}>{fmt(completingTask.total - completingTask.remaining)} worked · {fmt(completingTask.remaining)} left</div>
+                <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                  <button onClick={() => setShowCompleteDialog(false)} style={{ padding: "10px 24px", borderRadius: 10, border: `1px solid ${c.border}`, background: "transparent", color: c.textMuted, fontSize: 13, cursor: "pointer", fontFamily: "inherit" }}>Cancel</button>
+                  <button onClick={handleConfirmComplete} style={{ padding: "10px 24px", borderRadius: 10, border: "none", background: c.green, color: "#fff", fontSize: 13, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>Yes, complete</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Resume Picker */}
+          {showResumePicker && (
+            <div style={{ position: "fixed", inset: 0, background: c.overlay, display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, animation: "fadeIn 0.2s" }}>
+              <div style={{ background: c.bg, border: `1px solid ${c.border}`, borderRadius: 16, padding: 32, maxWidth: 380, width: "90%", boxShadow: `0 8px 32px ${c.shadow}`, animation: "slideDown 0.25s" }} onClick={(e) => e.stopPropagation()}>
+                <div style={{ fontSize: 16, fontWeight: 500, marginBottom: 6, textAlign: "center" }}>Break's over!</div>
+                <div style={{ fontSize: 13, color: c.textMuted, marginBottom: 24, textAlign: "center" }}>Which pomodoro would you like to resume?</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+                  {tasks.filter((t) => t.isPausedByBreak && t.remaining > 0).map((t) => (
+                    <button key={t.id} onClick={() => handleResumeTask(t.id)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "14px 16px", borderRadius: 10, border: `1px solid ${c.border}`, background: c.surface, cursor: "pointer", fontFamily: "inherit", color: c.text, fontSize: 14, textAlign: "left", transition: "all 0.15s", width: "100%" }} onMouseEnter={(e) => e.currentTarget.style.borderColor=c.accent} onMouseLeave={(e) => e.currentTarget.style.borderColor=c.border}>
+                      <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 15, color: c.accent, flexShrink: 0 }}>{fmt(t.remaining)}</span>
+                      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.name}</span>
+                    </button>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+                  <button onClick={() => { setPausedByBreak([]); setShowResumePicker(false); setTasks(p => p.map(t => t.isPausedByBreak ? {...t, isPausedByBreak: false} : t)); }} style={{ padding: "10px 20px", borderRadius: 10, border: `1px solid ${c.border}`, background: "transparent", color: c.textMuted, fontSize: 13, cursor: "pointer", fontFamily: "inherit" }}>Keep paused</button>
+                  {pausedByBreak.length > 1 && <button onClick={handleResumeAll} style={{ padding: "10px 20px", borderRadius: 10, border: "none", background: c.accent, color: "#fff", fontSize: 13, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>Resume all</button>}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Menu floating panel */}
+          {showMenu && (
+            <React.Fragment>
+              <div onClick={() => setShowMenu(false)} style={{ position: "fixed", inset: 0, zIndex: 150 }} />
+              <div style={{ position: "fixed", top: 58, right: 20, width: 360, background: c.surface, border: `1px solid ${c.border}`, borderRadius: 16, boxShadow: `0 8px 40px ${c.shadow}`, zIndex: 151, animation: "slideDown 0.2s ease", overflow: "hidden" }} onClick={(e) => e.stopPropagation()}>
+                {/* Tabs */}
+                <div style={{ display: "flex", borderBottom: `1px solid ${c.border}` }}>
+                  {[{ key: "report", label: "Report" }, { key: "settings", label: "Settings" }].map((tab) => (
+                    <button key={tab.key} onClick={() => setMenuTab(tab.key)} style={{ flex: 1, padding: "14px 0", border: "none", borderBottom: menuTab === tab.key ? `2px solid ${c.accent}` : "2px solid transparent", background: "transparent", color: menuTab === tab.key ? c.accent : c.textMuted, fontSize: 13, fontWeight: menuTab === tab.key ? 500 : 400, cursor: "pointer", fontFamily: "inherit", transition: "all 0.2s", marginBottom: -1 }}>{tab.label}</button>
+                  ))}
+                </div>
+                {/* Report tab */}
+                {menuTab === "report" && (
+                  <div style={{ padding: "20px 24px" }}>
+                    {sessions.length === 0 ? <p style={{ color: c.textMuted, fontSize: 13 }}>No sessions yet.</p> : (
+                      <React.Fragment>
+                        <div style={{ display: "flex", gap: 24, marginBottom: 20, flexWrap: "wrap" }}>
+                          <div><div style={{ fontSize: 26, fontWeight: 300, fontFamily: "'DM Mono',monospace" }}>{workSessions.length}</div><div style={{ fontSize: 11, color: c.textMuted, marginTop: 2 }}>Work</div></div>
+                          <div><div style={{ fontSize: 26, fontWeight: 300, fontFamily: "'DM Mono',monospace" }}>{avgWork}m</div><div style={{ fontSize: 11, color: c.textMuted, marginTop: 2 }}>Avg Work</div></div>
+                          <div><div style={{ fontSize: 26, fontWeight: 300, fontFamily: "'DM Mono',monospace" }}>{breakSessions.length}</div><div style={{ fontSize: 11, color: c.textMuted, marginTop: 2 }}>Breaks</div></div>
+                          <div><div style={{ fontSize: 26, fontWeight: 300, fontFamily: "'DM Mono',monospace" }}>{avgBreak}m</div><div style={{ fontSize: 11, color: c.textMuted, marginTop: 2 }}>Avg Break</div></div>
+                        </div>
+                        <div style={{ maxHeight: 180, overflowY: "auto" }}>
+                          {[...sessions].reverse().map((s, i) => (
+                            <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px solid ${c.border}`, fontSize: 12 }}>
+                              <span style={{ color: s.type === "Pomodoro" ? c.accent : c.textMuted }}>{s.type} — {s.task}</span>
+                              <span style={{ color: c.textMuted, fontFamily: "'DM Mono',monospace", fontSize: 11 }}>{Math.round(s.duration/60)}m · {s.completedAt}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </React.Fragment>
+                    )}
+                  </div>
+                )}
+                {/* Settings tab */}
+                {menuTab === "settings" && (
+                  <div style={{ padding: "20px 24px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                      <span style={{ fontSize: 13 }}>Theme</span>
+                      <div style={{ display: "flex", gap: 4, background: c.bgDim, padding: 4, borderRadius: 10 }}>
+                        {[{ key: "light", label: "Light" }, { key: "dark", label: "Dark" }, { key: "sepia", label: "Sepia" }].map((t) => (
+                          <button key={t.key} onClick={() => setTheme(t.key)} style={{ padding: "7px 16px", borderRadius: 7, border: "none", background: theme === t.key ? c.accent : "transparent", color: theme === t.key ? "#fff" : c.textMuted, fontSize: 12, fontWeight: theme === t.key ? 500 : 400, cursor: "pointer", fontFamily: "inherit", transition: "all 0.2s" }}>{t.label}</button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </React.Fragment>
+          )}
+
+          {/* Toast notifications */}
+          {toasts.length > 0 && (
+            <div style={{ position: "fixed", bottom: 24, right: 24, display: "flex", flexDirection: "column", gap: 8, zIndex: 200 }}>
+              {toasts.map((toast) => (
+                <div key={toast.id} style={{ background: c.surface, border: `1px solid ${c.border}`, borderRadius: 12, padding: "12px 16px", display: "flex", alignItems: "center", gap: 10, boxShadow: `0 4px 16px ${c.shadow}`, animation: "slideUp 0.3s ease", minWidth: 220, maxWidth: 300 }}>
+                  <svg width="16" height="16" viewBox="0 0 12 12" fill="none" style={{ flexShrink: 0 }}><path d="M2 6L5 9L10 3" stroke={c.green} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 11, color: c.textMuted, letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: 2 }}>Task done</div>
+                    <div style={{ fontSize: 13, color: c.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{toast.name}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <style>{`
+            @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+            @keyframes slideDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
+            @keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+            @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+            *{box-sizing:border-box;margin:0;padding:0}
+            ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(0,0,0,.1);border-radius:2px}
+          `}</style>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
