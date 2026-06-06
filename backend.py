@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 import os
-import time
+# import time
 from pydantic import BaseModel
 from typing import Literal
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +27,7 @@ cursor = conn.cursor()
 cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
         task TEXT NOT NULL,
         duration INTEGER NOT NULL,
         mode TEXT NOT NULL,
@@ -38,6 +39,20 @@ cursor.execute("""
 
     """)
 
+conn.commit()
+
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        password TEXT,
+        theme TEXT DEFAULT 'light'
+    )
+""")
+
+# Default users
+cursor.execute("INSERT OR IGNORE INTO users (name, password, theme) VALUES (?, ?, ?)", ("admin", "admin", "light"))
+cursor.execute("INSERT OR IGNORE INTO users (name, password, theme) VALUES (?, ?, ?)", ("temp", None, "light"))
 conn.commit()
 
 class SessionCreate(BaseModel):
@@ -56,6 +71,60 @@ class SessionUpdate(BaseModel):
 async def frontend():
     return FileResponse("index.html")
 
+
+# Basic User configurations
+
+class UserCreate(BaseModel):
+    name: str
+    password: str = None  # optional
+
+class UserLogin(BaseModel):
+    password: str
+
+class UserSettings(BaseModel):
+    password: str = None
+    theme: Literal["light", "dark", "sepia"] = None
+
+@app.get("/users")
+async def get_users():
+    cursor.execute("SELECT id, name, password IS NOT NULL as has_password, theme FROM users ORDER BY id")
+    return [
+        {"id": r[0], "name": r[1], "has_password": bool(r[2]), "theme": r[3]}
+        for r in cursor.fetchall()
+    ]
+
+@app.post("/users")
+async def create_user(data : UserCreate):
+    cursor.execute(
+         "INSERT INTO users (name, password) VALUES (?, ?)",
+        (data.name, data.password)
+    )
+    conn.commit()
+    return {"id": cursor.lastrowid, "name": data.name, "has_password": data.password is not None}
+
+@app.post("/users/{user_id}/login")
+async def login(user_id: int, data: UserLogin):
+    cursor.execute("SELECT password FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    if not row:
+        return {"success": False, "error": "User not found"}
+    if row[0] is None:
+        return {"success": True}  # no password set
+    if row[0] != data.password:
+        return {"success": False, "error": "Wrong password"}
+    return {"success": True}
+
+@app.put("/users/{user_id}/settings")
+async def update_settings(user_id: int, data: UserSettings):
+    if data.theme:
+        cursor.execute("UPDATE users SET theme = ? WHERE id = ?", (data.theme, user_id))
+    if data.password is not None:
+        pwd = data.password if data.password != "" else None
+        cursor.execute("UPDATE users SET password = ? WHERE id = ?", (pwd, user_id))
+    conn.commit()
+    return {"updated": True}
+
+
 #fetch image
 @app.get("/favicon.png")
 async def favicon():
@@ -63,15 +132,15 @@ async def favicon():
 
 
 # set pomodoro
-@app.post("/set_timer")
-async def set_timer(data : SessionCreate):
+@app.post("/{user_id}/set_timer")
+async def set_timer(user_id: int,data : SessionCreate):
     duration = data.timer
     task = data.task
     mode = data.method
     status = "Running"
     cursor.execute(
-        "INSERT INTO sessions (timer, task, duration, mode,status) VALUES (?, ?, ?, ?, ?)",
-        (data.timer,task, duration, mode, status)
+        "INSERT INTO sessions (user_id, timer, task, duration, mode,status) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, data.timer,task, duration, mode, status)
     )
     conn.commit()
 
@@ -80,23 +149,23 @@ async def set_timer(data : SessionCreate):
 
 
 # update backend 
-@app.put("/update_timer/{session_id}")
-async def update_timer(session_id :int, data : SessionUpdate):
+@app.put("/{user_id}/update_timer/{session_id}")
+async def update_timer(user_id :int,session_id :int, data : SessionUpdate):
 
     cursor.execute(
-        "UPDATE sessions SET status = ?, timer = ?,updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (data.status, data.timer, session_id)
+        "UPDATE sessions SET status = ?, timer = ?,updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+        (data.status, data.timer, session_id, user_id)
     )
     conn.commit()
     
     return {"id": session_id, "status": data.status, "timer": data.timer}
 
 
-@app.put("/task_complete/{session_id}")
-async def task_complete(session_id : int):
+@app.put("/{user_id}/task_complete/{session_id}")
+async def task_complete(user_id :int ,session_id : int):
     cursor.execute(
-        "UPDATE sessions SET status = ?, timer = ?,updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        ("completed", 0, session_id)
+        "UPDATE sessions SET status = ?, timer = ?,updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+        ("Completed", 0, session_id, user_id)
     )
     conn.commit()
 
@@ -104,24 +173,25 @@ async def task_complete(session_id : int):
 
 
 # get request for report analysis
-@app.get("/fetch_active_timer")
-async def fetch_active_timer():
+@app.get("/{user_id}/fetch_active_timer")
+async def fetch_active_timer(user_id:int):
     cursor.execute(
-        "SELECT * FROM sessions WHERE status IN (?, ?)",
-        ("Running", "Paused")
+        "SELECT * FROM sessions WHERE user_id = ? AND status IN (?, ?)",
+        (user_id, "Running", "Paused")
     )
     rows = cursor.fetchall()
     
     return [
         {
             "id": r[0],
-            "task": r[1],
-            "duration": r[2],
-            "mode": r[3],
-            "status": r[4],
-            "timer": r[5],
-            "created_at": r[6],
-            "updated_at": r[7],
+            "user_id": r[1],
+            "task": r[2],
+            "duration": r[3],
+            "mode": r[4],
+            "status": r[5],
+            "timer": r[6],
+            "created_at": r[7],
+            "updated_at": r[8],
         }
         for r in rows
     ]
@@ -131,11 +201,11 @@ class TimerBeat(BaseModel):
     timer: int
 
 
-@app.put("/heartbeat/{session_id}")
-async def heartbeat(session_id: int, data: TimerBeat):
+@app.put("/{user_id}/heartbeat/{session_id}")
+async def heartbeat(user_id:int, session_id: int, data: TimerBeat):
     cursor.execute(
-        "UPDATE sessions SET timer = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (data.timer, session_id),
+        "UPDATE sessions SET timer = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+        (data.timer, session_id, user_id),
     )
     conn.commit()
     return {"id": session_id, "timer": data.timer}

@@ -42,12 +42,23 @@
       const [completingTaskId, setCompletingTaskId] = useState(null);
       const [sessions, setSessions] = useState([]);
       const [toasts, setToasts] = useState([]);
+      const [currentUser, setCurrentUser] = useState(null);
+      const [users, setUsers] = useState([]);
+      const [usersLoaded, setUsersLoaded] = useState(false);
+      const [showAddUser, setShowAddUser] = useState(false);
+      const [newUserName, setNewUserName] = useState("");
+      const [newUserPassword, setNewUserPassword] = useState("");
+      const [loginTarget, setLoginTarget] = useState(null);
+      const [passwordInput, setPasswordInput] = useState("");
+      const [loginError, setLoginError] = useState("");
+      const [showPassword, setShowPassword] = useState(false);
       const audioCtxRef = useRef(null);
       const topRef = useRef(null);
       const bottomRef = useRef(null);
       const loadedRef = useRef(false);
 
       const BREAK_PRESETS = { short: 5, long: 15 };
+      const u = currentUser ? `/${currentUser.id}` : "";
 
       const playBeep = useCallback(() => {
         try {
@@ -70,6 +81,7 @@
       }, []);
 
       useEffect(() => {
+        if (!currentUser) return;
         const iv = setInterval(() => {
           setTasks((prev) => {
             const next = prev.map((t) => {
@@ -78,11 +90,11 @@
               if (n <= 0) {
                 playBeep();
                 setSessions((s) => [...s, { type: "Pomodoro", task: t.name, duration: t.total, completedAt: new Date().toLocaleTimeString() }]);
-                api.put(`/task_complete/${t.backendId}`);
+                api.put(`${u}/task_complete/${t.backendId}`);
                 showToast(t.name);
                 return null;
               }
-              if (n % 5 === 0) api.put(`/heartbeat/${t.backendId}`, { timer: n });
+              if (n % 5 === 0) api.put(`${u}/heartbeat/${t.backendId}`, { timer: n });
               return { ...t, remaining: n };
             });
             return next.filter(Boolean);
@@ -93,15 +105,15 @@
             if (next <= 0) {
               playBeep();
               setSessions((s) => [...s, { type: prev.mode === "short" ? "Short Break" : "Long Break", task: prev.name, duration: prev.total, completedAt: new Date().toLocaleTimeString() }]);
-              api.put(`/task_complete/${prev.backendId}`);
+              api.put(`${u}/task_complete/${prev.backendId}`);
               return { ...prev, remaining: 0, isRunning: false };
             }
-            if (next % 5 === 0) api.put(`/heartbeat/${prev.backendId}`, { timer: next });
+            if (next % 5 === 0) api.put(`${u}/heartbeat/${prev.backendId}`, { timer: next });
             return { ...prev, remaining: next };
           });
         }, 1000);
         return () => clearInterval(iv);
-      }, [playBeep]);
+      }, [playBeep, currentUser]);
 
       useEffect(() => {
         if (activeBreak && activeBreak.remaining === 0 && !activeBreak.isRunning) {
@@ -110,13 +122,40 @@
         }
       }, [activeBreak, pausedByBreak]);
 
+      // Reset password visibility whenever we switch between login / add-user views.
+      useEffect(() => { setShowPassword(false); }, [loginTarget, showAddUser]);
+
+      // Fetch the user list on mount; auto-login or prompt for password from saved session.
+      useEffect(() => {
+        api.get("/users").then((list) => {
+          if (!Array.isArray(list)) { setUsersLoaded(true); return; }
+          setUsers(list);
+          setUsersLoaded(true);
+          try {
+            const raw = localStorage.getItem("pomo-user");
+            if (raw) {
+              const saved = JSON.parse(raw);
+              const match = list.find((x) => x.id === saved.id && x.name === saved.name);
+              if (match) {
+                if (match.has_password) {
+                  setLoginTarget(match);
+                } else {
+                  setCurrentUser(match);
+                  if (match.theme) setTheme(match.theme);
+                }
+              }
+            }
+          } catch (e) {}
+        });
+      }, []);
+
       // Restore UI prefs + report from localStorage, and active timers from the backend.
       useEffect(() => {
+        if (!currentUser) return;
         try {
-          const raw = localStorage.getItem("pomo-prefs");
+          const raw = localStorage.getItem(`pomo-prefs-${currentUser.id}`);
           if (raw) {
             const s = JSON.parse(raw);
-            if (s.theme) setTheme(s.theme);
             if (s.mode) setMode(s.mode);
             if (typeof s.timerMinutes === "number") setTimerMinutes(s.timerMinutes);
             if (Array.isArray(s.sessions)) setSessions(s.sessions);
@@ -129,7 +168,7 @@
           return isNaN(t) ? 0 : Math.max(0, Math.floor((Date.now() - t) / 1000));
         };
 
-        api.get("/fetch_active_timer").then((rows) => {
+        api.get(`${u}/fetch_active_timer`).then((rows) => {
           if (Array.isArray(rows)) {
             const restoredTasks = [];
             let restoredBreak = null;
@@ -154,23 +193,23 @@
             if (restoredBreak) setActiveBreak(restoredBreak);
           }
         }).finally(() => { loadedRef.current = true; });
-      }, []);
+      }, [currentUser]);
 
-      // Persist UI prefs + report (timers live in the backend, not here).
+      // Persist UI prefs + report (timers live in the backend, theme lives on the user).
       useEffect(() => {
-        if (!loadedRef.current) return;
+        if (!loadedRef.current || !currentUser) return;
         try {
-          localStorage.setItem("pomo-prefs", JSON.stringify({ theme, mode, timerMinutes, sessions }));
+          localStorage.setItem(`pomo-prefs-${currentUser.id}`, JSON.stringify({ mode, timerMinutes, sessions }));
         } catch (e) {}
-      }, [theme, mode, timerMinutes, sessions]);
+      }, [mode, timerMinutes, sessions, currentUser]);
 
       const fmt = (s) => `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
       const handleWheel = (e) => { e.preventDefault(); setTimerMinutes((p) => Math.max(1, Math.min(90, p + (e.deltaY < 0 ? 1 : -1)))); };
 
       const handleStartPomodoro = async () => {
-        if (!taskInput.trim() || activeBreak) return;
+        if (!taskInput.trim() || activeBreak || !currentUser) return;
         const secs = timerMinutes * 60;
-        const res = await api.post("/set_timer", { method: MODE_MAP[mode] || "Work", timer: secs, task: taskInput.trim() });
+        const res = await api.post(`${u}/set_timer`, { method: MODE_MAP[mode] || "Work", timer: secs, task: taskInput.trim() });
         if (res?.id) {
           setTasks((p) => [...p, { id: Date.now(), backendId: res.id, name: taskInput.trim(), total: secs, remaining: secs, isRunning: true, isPausedByBreak: false, status: "Running" }]);
           setTaskInput("");
@@ -178,12 +217,12 @@
       };
 
       const handleStartBreak = async () => {
-        if (!breakInput.trim() || activeBreak) return;
+        if (!breakInput.trim() || activeBreak || !currentUser) return;
         const mins = BREAK_PRESETS[mode] || 5;
         const secs = mins * 60;
-        const res = await api.post("/set_timer", { method: MODE_MAP[mode], timer: secs, task: breakInput.trim() });
+        const res = await api.post(`${u}/set_timer`, { method: MODE_MAP[mode], timer: secs, task: breakInput.trim() });
         const runningTasks = tasks.filter((t) => t.isRunning);
-        for (const t of runningTasks) { api.put(`/update_timer/${t.backendId}`, { status: "Paused", timer: t.remaining }); }
+        for (const t of runningTasks) { api.put(`${u}/update_timer/${t.backendId}`, { status: "Paused", timer: t.remaining }); }
         const ids = runningTasks.map((t) => t.id);
         setTasks((p) => p.map((t) => t.isRunning ? { ...t, isRunning: false, isPausedByBreak: true } : t));
         setPausedByBreak(ids);
@@ -193,22 +232,22 @@
 
       const handleResumeTask = (id) => {
         const t = tasks.find((x) => x.id === id);
-        if (t) api.put(`/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining });
+        if (t) api.put(`${u}/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining });
         setTasks((p) => p.map((x) => x.id === id ? { ...x, isRunning: true, isPausedByBreak: false } : x));
         setPausedByBreak([]); setShowResumePicker(false);
       };
 
       const handleResumeAll = () => {
-        tasks.filter((t) => t.isPausedByBreak).forEach((t) => { api.put(`/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining }); });
+        tasks.filter((t) => t.isPausedByBreak).forEach((t) => { api.put(`${u}/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining }); });
         setTasks((p) => p.map((t) => t.isPausedByBreak ? { ...t, isRunning: true, isPausedByBreak: false } : t));
         setPausedByBreak([]); setShowResumePicker(false);
       };
 
       const handleCancelBreak = () => {
         if (!activeBreak) return;
-        api.put(`/task_complete/${activeBreak.backendId}`);
+        api.put(`${u}/task_complete/${activeBreak.backendId}`);
         tasks.filter((t) => t.isPausedByBreak).forEach((t) => {
-          api.put(`/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining });
+          api.put(`${u}/update_timer/${t.backendId}`, { status: "Running", timer: t.remaining });
         });
         setTasks((p) => p.map((t) => t.isPausedByBreak ? { ...t, isRunning: true, isPausedByBreak: false } : t));
         setActiveBreak(null);
@@ -218,7 +257,7 @@
       const handleTogglePause = (id) => {
         const t = tasks.find((x) => x.id === id);
         if (t && t.remaining > 0) {
-          api.put(`/update_timer/${t.backendId}`, { status: t.isRunning ? "Paused" : "Running", timer: t.remaining });
+          api.put(`${u}/update_timer/${t.backendId}`, { status: t.isRunning ? "Paused" : "Running", timer: t.remaining });
           setTasks((p) => p.map((x) => x.id === id ? { ...x, isRunning: !x.isRunning } : x));
         }
       };
@@ -227,7 +266,7 @@
 
       const handleConfirmComplete = () => {
         const t = tasks.find((x) => x.id === completingTaskId);
-        if (t) { api.put(`/task_complete/${t.backendId}`); setSessions((s) => [...s, { type: "Pomodoro", task: t.name, duration: t.total, completedAt: new Date().toLocaleTimeString() }]); showToast(t.name); }
+        if (t) { api.put(`${u}/task_complete/${t.backendId}`); setSessions((s) => [...s, { type: "Pomodoro", task: t.name, duration: t.total, completedAt: new Date().toLocaleTimeString() }]); showToast(t.name); }
         setTasks((p) => p.filter((x) => x.id !== completingTaskId));
         setShowCompleteDialog(false); setCompletingTaskId(null);
       };
@@ -235,6 +274,54 @@
       const handleDismiss = (id) => setTasks((p) => p.filter((t) => t.id !== id));
       const scrollToAdd = () => bottomRef.current?.scrollIntoView({ behavior: "smooth" });
       const scrollToTop = () => topRef.current?.scrollIntoView({ behavior: "smooth" });
+
+      // --- User auth handlers ---
+      const loginUser = (user) => {
+        setCurrentUser(user);
+        if (user.theme) setTheme(user.theme);
+        try { localStorage.setItem("pomo-user", JSON.stringify({ id: user.id, name: user.name })); } catch (e) {}
+        setLoginTarget(null); setPasswordInput(""); setLoginError("");
+        setShowAddUser(false); setNewUserName(""); setNewUserPassword("");
+      };
+
+      const handleSelectUser = (user) => {
+        if (user.has_password) { setLoginTarget(user); setLoginError(""); setPasswordInput(""); }
+        else loginUser(user);
+      };
+
+      const handleLogin = async () => {
+        if (!loginTarget) return;
+        const res = await api.post(`/users/${loginTarget.id}/login`, { password: passwordInput });
+        if (res?.success) loginUser(loginTarget);
+        else setLoginError(res?.error || "Login failed");
+      };
+
+      const handleCreateUser = async () => {
+        if (!newUserName.trim()) return;
+        const res = await api.post("/users", { name: newUserName.trim(), password: newUserPassword || null });
+        if (res?.id) {
+          const newUser = { id: res.id, name: res.name, has_password: !!res.has_password, theme: "light" };
+          setUsers((p) => [...p, newUser]);
+          loginUser(newUser);
+        }
+      };
+
+      const handleLogout = () => {
+        setCurrentUser(null);
+        setTasks([]); setSessions([]); setActiveBreak(null); setPausedByBreak([]);
+        setShowMenu(false); setShowResumePicker(false);
+        loadedRef.current = false;
+        try { localStorage.removeItem("pomo-user"); } catch (e) {}
+      };
+
+      const handleThemeChange = (newTheme) => {
+        setTheme(newTheme);
+        if (currentUser) {
+          api.put(`/users/${currentUser.id}/settings`, { theme: newTheme });
+          setUsers((p) => p.map((x) => x.id === currentUser.id ? { ...x, theme: newTheme } : x));
+          setCurrentUser((x) => x ? { ...x, theme: newTheme } : x);
+        }
+      };
 
       const THEMES = {
         light: { bg: "#faf8f5", bgDim: "#f0ece6", surface: "#ffffff", text: "#2d2d2d", textMuted: "#999", accent: "#d35d45", accentSoft: "rgba(211,93,69,0.08)", ring: "#d35d45", ringTrack: "rgba(211,93,69,0.1)", border: "rgba(0,0,0,0.06)", shadow: "rgba(0,0,0,0.06)", overlay: "rgba(0,0,0,0.35)", green: "#16a34a", greenSoft: "rgba(22,163,74,0.08)", pillBg: "#ffffff" },
@@ -270,6 +357,7 @@
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <div style={{ width: 7, height: 7, borderRadius: "50%", background: c.accent, animation: hasRunning ? "pulse 2s infinite" : "none" }} />
               <span style={{ fontSize: 14, fontWeight: 500, letterSpacing: "0.08em", textTransform: "uppercase" }}>Pomo</span>
+              {currentUser && <button onClick={handleLogout} title="Switch user" style={{ fontSize: 11, color: c.accent, background: c.accentSoft, border: "none", padding: "3px 10px", borderRadius: 6, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>{currentUser.name}</button>}
               {activeTasks.length > 0 && <span style={{ fontSize: 10, color: c.accent, background: c.accentSoft, padding: "2px 8px", borderRadius: 6, fontWeight: 500 }}>{activeTasks.filter((t)=>t.isRunning).length} active</span>}
             </div>
             <div style={{ display: "flex", gap: 6 }}>
@@ -487,14 +575,84 @@
                       <span style={{ fontSize: 13 }}>Theme</span>
                       <div style={{ display: "flex", gap: 4, background: c.bgDim, padding: 4, borderRadius: 10 }}>
                         {[{ key: "light", label: "Light" }, { key: "dark", label: "Dark" }, { key: "sepia", label: "Sepia" }].map((t) => (
-                          <button key={t.key} onClick={() => setTheme(t.key)} style={{ padding: "7px 16px", borderRadius: 7, border: "none", background: theme === t.key ? c.accent : "transparent", color: theme === t.key ? "#fff" : c.textMuted, fontSize: 12, fontWeight: theme === t.key ? 500 : 400, cursor: "pointer", fontFamily: "inherit", transition: "all 0.2s" }}>{t.label}</button>
+                          <button key={t.key} onClick={() => handleThemeChange(t.key)} style={{ padding: "7px 16px", borderRadius: 7, border: "none", background: theme === t.key ? c.accent : "transparent", color: theme === t.key ? "#fff" : c.textMuted, fontSize: 12, fontWeight: theme === t.key ? 500 : 400, cursor: "pointer", fontFamily: "inherit", transition: "all 0.2s" }}>{t.label}</button>
                         ))}
                       </div>
+                    </div>
+                    <div style={{ marginTop: 24, paddingTop: 20, borderTop: `1px solid ${c.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <span style={{ fontSize: 12, color: c.textMuted }}>Signed in as <span style={{ color: c.text, fontWeight: 500 }}>{currentUser?.name}</span></span>
+                      <button onClick={handleLogout} style={{ background: "transparent", border: `1px solid ${c.border}`, color: c.text, padding: "6px 14px", borderRadius: 8, cursor: "pointer", fontSize: 12, fontFamily: "inherit", transition: "all 0.2s" }} onMouseEnter={(e) => e.currentTarget.style.borderColor=c.accent} onMouseLeave={(e) => e.currentTarget.style.borderColor=c.border}>Switch User</button>
                     </div>
                   </div>
                 )}
               </div>
             </React.Fragment>
+          )}
+
+          {/* User selection overlay */}
+          {!currentUser && usersLoaded && (
+            <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.15)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", zIndex: 250, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+              <div style={{ background: c.surface, border: `1px solid ${c.border}`, borderRadius: 20, padding: "36px 32px", width: "100%", maxWidth: 400, maxHeight: "80vh", overflowY: "auto", boxShadow: `0 12px 48px ${c.shadow}`, animation: "slideDown 0.25s ease" }}>
+                {/* Header */}
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%", background: c.accent }} />
+                  <span style={{ fontSize: 18, fontWeight: 500, letterSpacing: "0.02em" }}>Pomodoro</span>
+                </div>
+                <div style={{ fontSize: 13, color: c.textMuted, marginBottom: 28 }}>
+                  {loginTarget ? "Enter your password" : showAddUser ? "Create a new user" : "Who's focusing today?"}
+                </div>
+
+                {/* View 2 — Password prompt */}
+                {loginTarget ? (
+                  <React.Fragment>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+                      <div style={{ width: 44, height: 44, borderRadius: "50%", background: c.accent, color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, fontWeight: 500, flexShrink: 0 }}>{loginTarget.name.charAt(0).toUpperCase()}</div>
+                      <div style={{ fontSize: 16, fontWeight: 500 }}>{loginTarget.name}</div>
+                    </div>
+                    <div style={{ position: "relative", marginBottom: loginError ? 8 : 20 }}>
+                      <input type={showPassword ? "text" : "password"} value={passwordInput} autoFocus onChange={(e) => setPasswordInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleLogin()} placeholder="Password" style={{ background: c.bg, border: `1px solid ${c.border}`, borderRadius: 10, color: c.text, fontSize: 14, fontFamily: "inherit", padding: "12px 40px 12px 14px", width: "100%", outline: "none", transition: "all 0.2s" }} onFocus={(e) => e.target.style.borderColor=c.accent} onBlur={(e) => e.target.style.borderColor=c.border} />
+                      <button onClick={() => setShowPassword((p) => !p)} style={{ position: "absolute", right: 0, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", cursor: "pointer", padding: "4px 8px", color: c.textMuted, fontSize: 14 }}>{showPassword ? "🙈" : "👁"}</button>
+                    </div>
+                    {loginError && <div style={{ fontSize: 12, color: c.accent, marginBottom: 16 }}>{loginError}</div>}
+                    <div style={{ display: "flex", gap: 10 }}>
+                      <button onClick={() => { setLoginTarget(null); setPasswordInput(""); setLoginError(""); }} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: `1px solid ${c.border}`, background: "transparent", color: c.textMuted, fontSize: 13, cursor: "pointer", fontFamily: "inherit" }}>Back</button>
+                      <button onClick={handleLogin} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: "none", background: c.accent, color: "#fff", fontSize: 13, fontWeight: 500, cursor: "pointer", fontFamily: "inherit" }}>Login</button>
+                    </div>
+                  </React.Fragment>
+                ) : showAddUser ? (
+                  /* View 3 — Add user form */
+                  <React.Fragment>
+                    <input type="text" value={newUserName} autoFocus onChange={(e) => setNewUserName(e.target.value)} placeholder="Name" style={{ background: c.bg, border: `1px solid ${c.border}`, borderRadius: 10, color: c.text, fontSize: 14, fontFamily: "inherit", padding: "12px 14px", width: "100%", outline: "none", marginBottom: 12, transition: "all 0.2s" }} onFocus={(e) => e.target.style.borderColor=c.accent} onBlur={(e) => e.target.style.borderColor=c.border} />
+                    <div style={{ position: "relative", marginBottom: 6 }}>
+                      <input type={showPassword ? "text" : "password"} value={newUserPassword} onChange={(e) => setNewUserPassword(e.target.value)} onKeyDown={(e) => e.key === "Enter" && handleCreateUser()} placeholder="Password" style={{ background: c.bg, border: `1px solid ${c.border}`, borderRadius: 10, color: c.text, fontSize: 14, fontFamily: "inherit", padding: "12px 40px 12px 14px", width: "100%", outline: "none", transition: "all 0.2s" }} onFocus={(e) => e.target.style.borderColor=c.accent} onBlur={(e) => e.target.style.borderColor=c.border} />
+                      <button onClick={() => setShowPassword((p) => !p)} style={{ position: "absolute", right: 0, top: "50%", transform: "translateY(-50%)", background: "transparent", border: "none", cursor: "pointer", padding: "4px 8px", color: c.textMuted, fontSize: 14 }}>{showPassword ? "🙈" : "👁"}</button>
+                    </div>
+                    <div style={{ fontSize: 11, color: c.textMuted, marginBottom: 20 }}>Leave blank for no password</div>
+                    <div style={{ display: "flex", gap: 10 }}>
+                      <button onClick={() => { setShowAddUser(false); setNewUserName(""); setNewUserPassword(""); }} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: `1px solid ${c.border}`, background: "transparent", color: c.textMuted, fontSize: 13, cursor: "pointer", fontFamily: "inherit" }}>Cancel</button>
+                      <button onClick={handleCreateUser} disabled={!newUserName.trim()} style={{ flex: 1, padding: "11px 0", borderRadius: 10, border: "none", background: newUserName.trim() ? c.accent : c.border, color: newUserName.trim() ? "#fff" : c.textMuted, fontSize: 13, fontWeight: 500, cursor: newUserName.trim() ? "pointer" : "not-allowed", fontFamily: "inherit" }}>Create</button>
+                    </div>
+                  </React.Fragment>
+                ) : (
+                  /* View 1 — User list */
+                  <React.Fragment>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 }}>
+                      {users.map((user) => (
+                        <button key={user.id} onClick={() => handleSelectUser(user)} style={{ display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", borderRadius: 12, border: `1px solid ${c.border}`, background: c.bg, cursor: "pointer", fontFamily: "inherit", textAlign: "left", transition: "all 0.15s", width: "100%" }} onMouseEnter={(e) => e.currentTarget.style.borderColor=c.accent} onMouseLeave={(e) => e.currentTarget.style.borderColor=c.border}>
+                          <div style={{ width: 40, height: 40, borderRadius: "50%", background: c.accentSoft, color: c.accent, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 500, flexShrink: 0 }}>{user.name.charAt(0).toUpperCase()}</div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontSize: 14, color: c.text, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{user.name}</div>
+                            {user.has_password && <div style={{ fontSize: 11, color: c.textMuted, marginTop: 1 }}>🔒 Password</div>}
+                          </div>
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" style={{ flexShrink: 0 }}><path d="M6 4L10 8L6 12" stroke={c.textMuted} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg>
+                        </button>
+                      ))}
+                    </div>
+                    <button onClick={() => { setShowAddUser(true); setNewUserName(""); setNewUserPassword(""); }} style={{ width: "100%", padding: "12px 0", borderRadius: 12, border: `1.5px dashed ${c.border}`, background: "transparent", color: c.textMuted, fontSize: 13, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s" }} onMouseEnter={(e) => { e.currentTarget.style.borderColor=c.accent; e.currentTarget.style.color=c.accent; }} onMouseLeave={(e) => { e.currentTarget.style.borderColor=c.border; e.currentTarget.style.color=c.textMuted; }}>+ Add User</button>
+                  </React.Fragment>
+                )}
+              </div>
+            </div>
           )}
 
           {/* Toast notifications */}
